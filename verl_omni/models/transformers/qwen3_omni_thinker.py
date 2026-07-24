@@ -121,6 +121,7 @@ def patch_hf_processor_for_qwen3_omni() -> None:
             return result
 
         try:
+            import numpy as np
             from transformers import AutoConfig, AutoProcessor, PreTrainedTokenizerBase
 
             processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
@@ -145,6 +146,47 @@ def patch_hf_processor_for_qwen3_omni() -> None:
 
             processor.get_rope_index = _get_rope_index_long
             processor.get_llm_pos_ids_for_vision = types.MethodType(model_class.get_llm_pos_ids_for_vision, processor)
+
+            def _dedup_pad_tokens(self, prompt_ids: list[int]) -> list[int]:
+                """Collapse consecutive multimodal pad tokens to one.
+
+                HF processor and vLLM's ``_apply_prompt_updates`` both expand the pad
+                token, causing double expansion. Collapse every run of identical
+                placeholder tokens before sending to vLLM-Omni, mirroring
+                ``verl.workers.rollout.utils.qwen2_5_vl_dedup_image_tokens``.
+                """
+                tokenizer = getattr(self, "tokenizer", None)
+                if tokenizer is None:
+                    return prompt_ids
+
+                pad_ids: set[int] = set()
+                for tok_attr in ("image_token", "video_token", "audio_token"):
+                    tok = getattr(self, tok_attr, None)
+                    if tok is None:
+                        continue
+                    try:
+                        tid = tokenizer.convert_tokens_to_ids(tok)
+                    except Exception:
+                        continue
+                    if tid is None or tid == getattr(tokenizer, "unk_token_id", None):
+                        continue
+                    pad_ids.add(int(tid))
+                if not pad_ids:
+                    return prompt_ids
+
+                arr = np.asarray(prompt_ids, dtype=np.int64)
+                if arr.size == 0:
+                    return prompt_ids
+                is_pad = np.isin(arr, list(pad_ids))
+                # Collapse consecutive identical pad tokens to one: HF processor and
+                # vLLM's _apply_prompt_updates both expand the pad token, so the raw
+                # prompt_ids already carries the full run.
+                keep = np.ones(arr.size, dtype=bool)
+                same_as_prev = is_pad[1:] & is_pad[:-1] & (arr[1:] == arr[:-1])
+                keep[1:] &= ~same_as_prev
+                return arr[keep].tolist()
+
+            processor.dedup_pad_tokens = types.MethodType(_dedup_pad_tokens, processor)
             return processor
         except Exception:
             return None
