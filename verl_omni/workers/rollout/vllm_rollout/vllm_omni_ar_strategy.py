@@ -28,6 +28,12 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 from vllm import SamplingParams
 from vllm_omni.lora.request import LoRARequest
 
+from verl_omni.workers.rollout.vllm_rollout.prompt_hidden_states import (
+    RETURN_FLAG_KEY,
+    apply_prompt_hidden_states_patches,
+    extract_prompt_hidden_states,
+)
+
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.config import OmniModelConfig
@@ -305,6 +311,7 @@ class ARStrategy(OmniStrategyBase):
         else:
             sampling_params["logprobs"] = None
         sampling_params.setdefault("repetition_penalty", getattr(self.server.config, "repetition_penalty", 1.0))
+        return_prompt_hidden = bool(sampling_params.pop("return_prompt_hidden_states", False))
         policy_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         if self._rollout_output_modalities is not None:
             default_stage_sampling_params = self.server.engine.default_sampling_params_list
@@ -328,6 +335,9 @@ class ARStrategy(OmniStrategyBase):
             prompt.setdefault("multi_modal_data", multi_modal_data)
         if mm_processor_kwargs and not adapter_prepared_prompt:
             prompt.setdefault("mm_processor_kwargs", mm_processor_kwargs)
+        if return_prompt_hidden:
+            apply_prompt_hidden_states_patches()
+            prompt["model_intermediate_buffer"] = {RETURN_FLAG_KEY: True}
         return prompt, params
 
     async def run_generation(
@@ -392,6 +402,12 @@ class ARStrategy(OmniStrategyBase):
                 result_dict=extra_fields,
             )
 
+        # Teacher hidden states ride CompletionOutput.multimodal_output when the
+        # request opted in via sampling_params["return_prompt_hidden_states"]
+        # (popped in preprocess_input; presence of the payload is the signal).
+        hidden = extract_prompt_hidden_states(req_output)
+        if hidden is not None:
+            extra_fields["teacher_hidden_states"] = hidden
         token_ids = req_output.outputs[0].token_ids
         log_probs = None
         policy_params = params[self._policy_stage_index] if isinstance(params, list) else params
