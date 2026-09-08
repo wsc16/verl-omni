@@ -66,8 +66,47 @@ def apply_prompt_hidden_states_patches() -> None:
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     _patch_runner(GPUARModelRunner)
+    _patch_npu_runner()
     _applied = True
     logger.info("vllm_omni prompt-hidden-states patches applied")
+
+
+def _patch_npu_runner() -> None:
+    """Patch the Ascend AR runner, which builds OmniModelRunnerOutput inline.
+
+    NPUARModelRunner.sample_tokens clears ``execute_model_state`` and returns
+    either an OmniModelRunnerOutput or an AsyncGPUModelRunnerOutput wrapper.
+    We peek the state first, call the original, then attach the per-request
+    hidden payloads to the inner model_runner_output.
+    """
+    try:
+        from vllm_omni.platforms.npu.worker.npu_ar_model_runner import NPUARModelRunner
+    except ImportError:
+        return  # non-Ascend deployment
+
+    original_sample = NPUARModelRunner.sample_tokens
+
+    def _sample_with_prompt_hidden_states(self, grammar_output):
+        state = self.execute_model_state
+        scheduler_output = state[0] if state is not None else None
+        hidden_states = state[4] if state is not None else None
+
+        output = original_sample(self, grammar_output)
+
+        if scheduler_output is None or hidden_states is None:
+            return output
+
+        payloads = _collect_prompt_hidden_payloads(self, scheduler_output, hidden_states)
+        if not payloads:
+            return output
+
+        # Sync path returns OmniModelRunnerOutput directly; async scheduling
+        # wraps it in AsyncGPUModelRunnerOutput (private _model_runner_output).
+        target = getattr(output, "_model_runner_output", None) or output
+        _merge_into_multimodal_outputs(target, payloads)
+        return output
+
+    NPUARModelRunner.sample_tokens = _sample_with_prompt_hidden_states
 
 
 def _patch_runner(runner_cls: type) -> None:
@@ -102,7 +141,11 @@ def _collect_prompt_hidden_payloads(runner, scheduler_output, hidden_states) -> 
     truncated tensors.
     """
     num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-    query_start_loc_cpu = runner._snapshot_query_start_loc_cpu()
+    snapshot_qsl = getattr(runner, "_snapshot_query_start_loc_cpu", None)
+    if callable(snapshot_qsl):
+        query_start_loc_cpu = snapshot_qsl()
+    else:  # NPU AR runner keeps a padded query_start_loc buffer
+        query_start_loc_cpu = runner.query_start_loc.cpu
 
     payloads: dict[str, dict] = {}
     for req_id, num_tokens in num_scheduled_tokens.items():
