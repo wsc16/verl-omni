@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Qwen3-Omni Thinker GSPO + LoRA training on MMK12 with omni V1 trainer.
+# Qwen3-Omni Thinker GSPO + LoRA + Full-Vocabulary (Nitrobrew) OPD on MMK12.
+#
+# Same recipe as the top-k OPD run, but with the teacher serving the thinker's
+# last-layer hidden states (not logprobs) and the actor reconstructing teacher
+# logits in vocab chunks via teacher lm_head (chunked online-softmax KL).
+# Loss is supervised (use_policy_gradient=false): the full-vocab signal is
+# backpropagated directly.
+#
 # Data preparation (run once):
 #   pip install math-verify
 #   python examples/gspo_trainer/data_process/mmk12.py \
@@ -9,27 +16,50 @@
 # Runtime dependencies (all Ray worker nodes):
 #   pip install math-verify    # required by mmk12_reward.py
 #   pip install qwen-vl-utils  # required for multimodal data processing
+#
+# Validated on 2x Ascend 910C (student rollout/actor + 2-node teacher pool).
+#
+# Start the task as follows (replace <head_ip> and <port> with the actual values from the head node):
+#   1. On the master node (node 1): ray start --head
+#   2. On the slave node (node 2): ray start --address='<head_ip>:<port>'
+#   3. Run this script on the master node to start the training task.
 
 set -x
 
 export VLLM_ASCEND_ENABLE_NZ=0
+# Disable Ray log deduplication so per-process pHs-debug prints survive.
+export RAY_DEDUP_LOGS=0
 # Make verl_omni available to Ray workers
 export VERL_USE_EXTERNAL_MODULES=verl_omni
-export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
-MODEL_PATH=${MODEL_PATH:-"/home/w00934247/ckpt/Qwen3-Omni-30B-A3B-Instruct"}
+# Nitrobrew loss mode requires the tur init of the omni loss fn + the
+# agent-loop hidden-state manager; both are enabled by the config below.
+
+STUDENT_MODEL=${STUDENT_MODEL:-"/home/w00934247/ckpt/Qwen3-Omni-30B-A3B-Instruct"}
+TEACHER_MODEL=${TEACHER_MODEL:-"/home/w00934247/ckpt/Qwen3-Omni-30B-A3B-Instruct"}
+
 TRAIN_FILE=${TRAIN_FILE:-"/home/w00934247/wsc/mmk12/verl_data/train.parquet"}
 VAL_FILE=${VAL_FILE:-"/home/w00934247/wsc/mmk12/verl_data/test.parquet"}
 REWARD_FUNCTION_PATH=${REWARD_FUNCTION_PATH:-"verl_omni/utils/reward_score/mmk12_reward.py"}
 
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-4}
+TEACHER_N_GPUS_PER_NODE=${TEACHER_N_GPUS_PER_NODE:-4}
+
+# Single-node runs that expose only a subset of the physical NPUs
+# (e.g. ASCEND_RT_VISIBLE_DEVICES="8..15") must split the visible cards
+# between the actor pool and the teacher pool, so student + teacher fit
+# within the exposed budget. Override per-run:
+#   N_GPUS_PER_NODE=4 TEACHER_N_GPUS_PER_NODE=4
+# for an 8-visible-card node.
+
 python3 -m verl_omni.trainer.main_omni \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
-    data.train_batch_size=128 \
+    data.train_batch_size=32 \
     data.max_prompt_length=4096 \
     data.max_response_length=4096 \
     data.truncation='error' \
     data.filter_overlong_prompts=true \
-    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.path="${STUDENT_MODEL}" \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=64 \
     actor_rollout_ref.model.lora_dtype=float32 \
@@ -45,7 +75,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.optim.clip_grad=1.0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.policy_loss.loss_mode=gspo \
     actor_rollout_ref.actor.clip_ratio_low=3e-4 \
@@ -55,22 +85,25 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
-    actor_rollout_ref.rollout.n=16 \
+    actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.cudagraph_capture_sizes="[1,2,4,16,64,128,512,1024,2048,3072,4096]" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.prompt_length=4160 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.enable_prefix_caching=False \
+    actor_rollout_ref.rollout.enforce_eager=true \
+    actor_rollout_ref.rollout.free_cache_engine=false \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.omni_agent_loop.OmniAgentLoopManagerTQ \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.output_mode="ar" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name="qwen3_omni_moe" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     algorithm.adv_estimator=grpo \
@@ -84,10 +117,28 @@ python3 -m verl_omni.trainer.main_omni \
     trainer.critic_warmup=0 \
     trainer.logger='["console","tensorboard"]' \
     trainer.project_name=gspo \
-    trainer.experiment_name=qwen3_omni_thinker_lora_mmk12 \
-    trainer.n_gpus_per_node=8 \
+    trainer.experiment_name=qwen3_omni_thinker_lora_mmk12_opd_nitrobrew_npu \
+    trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \
     trainer.total_epochs=10 \
+    distillation.enabled=true \
+    distillation.nnodes=1 \
+    distillation.n_gpus_per_node=${TEACHER_N_GPUS_PER_NODE} \
+    distillation.teacher_models.teacher_model.model_path="${TEACHER_MODEL}" \
+    distillation.teacher_models.teacher_model.inference.name=vllm_omni \
+    distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=2 \
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.4 \
+    distillation.teacher_models.teacher_model.inference.max_model_len=12288 \
+    distillation.teacher_models.teacher_model.inference.prompt_length=4160 \
+    distillation.teacher_models.teacher_model.inference.response_length=4096 \
+    distillation.teacher_models.teacher_model.inference.enable_chunked_prefill=false \
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=12288 \
+    distillation.teacher_models.teacher_model.inference.enforce_eager=true \
+    distillation.teacher_models.teacher_model.inference.free_cache_engine=false \
+    +distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm_omni.output_mode="ar" \
+    +distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm_omni.pipeline_name="qwen3_omni_moe" \
+    distillation.distillation_loss.loss_mode=nitrobrew \
+    distillation.distillation_loss.use_policy_gradient=false \
     "$@"

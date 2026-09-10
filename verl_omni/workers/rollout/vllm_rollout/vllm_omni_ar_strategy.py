@@ -338,6 +338,11 @@ class ARStrategy(OmniStrategyBase):
         if return_prompt_hidden:
             apply_prompt_hidden_states_patches()
             prompt["model_intermediate_buffer"] = {RETURN_FLAG_KEY: True}
+            print(
+                "[pHs-debug] preprocess_input set buffer pid=%s req_buffer=%s"
+                % (os.getpid(), prompt["model_intermediate_buffer"]),
+                flush=True,
+            )
         return prompt, params
 
     async def run_generation(
@@ -406,6 +411,13 @@ class ARStrategy(OmniStrategyBase):
         # request opted in via sampling_params["return_prompt_hidden_states"]
         # (popped in preprocess_input; presence of the payload is the signal).
         hidden = extract_prompt_hidden_states(req_output)
+        if hidden is None and bool(sampling_params.get("return_prompt_hidden_states", False)):
+            mm_obj = getattr(req_output.outputs[0], "multimodal_output", None)
+            print(
+                "[pHs-debug] process_output NO hidden pid=%s mm_type=%s mm=%s"
+                % (os.getpid(), type(mm_obj).__name__, mm_obj),
+                flush=True,
+            )
         if hidden is not None:
             extra_fields["teacher_hidden_states"] = hidden
         token_ids = req_output.outputs[0].token_ids

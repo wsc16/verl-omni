@@ -40,6 +40,12 @@ first appears on a request.
 """
 
 import logging
+import os as _os
+
+
+def _pHs_print(*args):  # noqa: N802 - explicit flush helper for Ray dedup-safe logs
+    print("[pHs-debug]", *args, flush=True)
+
 
 logger = logging.getLogger(__file__)
 
@@ -54,21 +60,41 @@ _applied = False
 def request_wants_prompt_hidden_states(runner, req_id: str) -> bool:
     """True when the request opted in via model_intermediate_buffer."""
     info = runner.model_intermediate_buffer.get(req_id)
-    return bool(isinstance(info, dict) and info.get(RETURN_FLAG_KEY))
+    wants = bool(isinstance(info, dict) and info.get(RETURN_FLAG_KEY))
+    if not wants:
+        # Only log when the flag is missing — surfaces whether the buffer reaches
+        # the runner at all. Keep it terse to avoid per-token log spam.
+        buf = getattr(runner, "model_intermediate_buffer", None)
+        _pHs_print(
+            "request_wants MISS pid=%s req=%s info=%s buf_keys=%s"
+            % (
+                _os.getpid(),
+                req_id,
+                (list(info) if isinstance(info, dict) else type(info).__name__) if info is not None else None,
+                list(buf.keys())[:8] if hasattr(buf, "keys") else type(buf).__name__,
+            ),
+        )
+    return wants
 
 
 def apply_prompt_hidden_states_patches() -> None:
     """Install the hidden-state output channel patches (idempotent)."""
     global _applied
+    _pHs_print("apply_patches ENTER pid=%s _applied=%s" % (_os.getpid(), _applied))
     if _applied:
         return
 
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+    try:
+        from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
-    _patch_runner(GPUARModelRunner)
-    _patch_npu_runner()
-    _applied = True
-    logger.info("vllm_omni prompt-hidden-states patches applied")
+        _pHs_print("apply_patches GPUARModelRunner imported pid=%s cls=%s" % (_os.getpid(), GPUARModelRunner))
+        _patch_runner(GPUARModelRunner)
+        _patch_npu_runner()
+        _applied = True
+        _pHs_print("apply_patches DONE pid=%s" % _os.getpid())
+    except Exception as exc:  # pragma: no cover - defensive across envs
+        _pHs_print("apply_patches FAILED pid=%s exc=%r" % (_os.getpid(), exc))
+        raise
 
 
 def _patch_npu_runner() -> None:
@@ -81,22 +107,35 @@ def _patch_npu_runner() -> None:
     """
     try:
         from vllm_omni.platforms.npu.worker.npu_ar_model_runner import NPUARModelRunner
-    except ImportError:
+    except ImportError as exc:
+        _pHs_print("_patch_npu_runner SKIP ImportError pid=%s exc=%r" % (_os.getpid(), exc))
         return  # non-Ascend deployment
 
     original_sample = NPUARModelRunner.sample_tokens
+    _pHs_print("_patch_npu_runner patching pid=%s runner=%s orig=%s" % (_os.getpid(), NPUARModelRunner, original_sample))
 
     def _sample_with_prompt_hidden_states(self, grammar_output):
         state = self.execute_model_state
         scheduler_output = state[0] if state is not None else None
         hidden_states = state[4] if state is not None else None
+        _pHs_print(
+            "sample_tokens ENTER pid=%s state=%s hidden=%s n_sched=%s"
+            % (
+                _os.getpid(),
+                state is not None,
+                None if hidden_states is None else tuple(hidden_states.shape),
+                set(scheduler_output.num_scheduled_tokens) if scheduler_output is not None else None,
+            )
+        )
 
         output = original_sample(self, grammar_output)
 
         if scheduler_output is None or hidden_states is None:
+            _pHs_print("sample_tokens SKIP no state/hidden pid=%s" % _os.getpid())
             return output
 
         payloads = _collect_prompt_hidden_payloads(self, scheduler_output, hidden_states)
+        _pHs_print("sample_tokens collected pid=%s keys=%s" % (_os.getpid(), list(payloads)))
         if not payloads:
             return output
 
@@ -104,9 +143,11 @@ def _patch_npu_runner() -> None:
         # wraps it in AsyncGPUModelRunnerOutput (private _model_runner_output).
         target = getattr(output, "_model_runner_output", None) or output
         _merge_into_multimodal_outputs(target, payloads)
+        _pHs_print("sample_tokens merged pid=%s target=%s" % (_os.getpid(), type(target).__name__))
         return output
 
     NPUARModelRunner.sample_tokens = _sample_with_prompt_hidden_states
+    _pHs_print("_patch_npu_runner DONE pid=%s" % _os.getpid())
 
 
 def _patch_runner(runner_cls: type) -> None:

@@ -49,10 +49,32 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
     _pending_lora_peft_config: dict | None = None
 
     def __new__(cls, **kwargs):
+        import os as _os
+
         set_death_signal()
+        print(
+            "[pHs-debug] vLLMOmniColocateWorkerExtension.__new__ ENTER pid=%s cls=%s kwargs_keys=%s"
+            % (_os.getpid(), cls.__name__, sorted(kwargs.keys())),
+            flush=True,
+        )
 
         # 1. patch for Lora
         VLLMOmniHijack.hijack()
+        # The prompt-hidden-states patch must live in the worker sub-process
+        # (NPUARModelRunner runs in a StageEngineCoreProc spawned by vLLM-Omni,
+        # so patches installed on the server actor do not propagate). The worker
+        # extension materializes inside that sub-process, so install it here.
+        try:
+            from verl_omni.workers.rollout.vllm_rollout.prompt_hidden_states import (
+                apply_prompt_hidden_states_patches,
+            )
+
+            print("[pHs-debug] worker_ext calling apply_patches pid=%s" % _os.getpid(), flush=True)
+            apply_prompt_hidden_states_patches()
+            print("[pHs-debug] worker_ext apply_patches returned pid=%s" % _os.getpid(), flush=True)
+        except Exception as exc:  # pragma: no cover - defensive across envs
+            print("[pHs-debug] worker_ext apply_patches FAILED pid=%s exc=%r" % (_os.getpid(), exc), flush=True)
+            logger.warning("prompt-hidden-states patch install failed in worker ext: %r", exc)
 
         return super().__new__(cls)
 
@@ -255,3 +277,25 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             if 0 <= local_rank < len(stage_entries) and stage_entries[local_rank] in replica_entries:
                 local_rank = replica_entries.index(stage_entries[local_rank])
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{local_rank}.sock"
+
+
+class vLLMOmniPromptHiddenStatesWorkerExtension:
+    """vLLM AR worker extension installing the prompt-hidden-states patch.
+
+    Passed as vLLM's ``--worker-extension-cls`` for AR rollouts: vLLM dynamically
+    inherits this bare class into the AR worker class, so ``__new__`` runs inside
+    the StageEngineCoreProc sub-process where NPUARModelRunner lives. Kept to a
+    single ``__new__`` (no other attribute) to pass vLLM's extension-conflict
+    check against the worker class.
+    """
+
+    def __new__(cls, **kwargs):
+        try:
+            from verl_omni.workers.rollout.vllm_rollout.prompt_hidden_states import (
+                apply_prompt_hidden_states_patches,
+            )
+
+            apply_prompt_hidden_states_patches()
+        except Exception as exc:  # pragma: no cover - defensive across envs
+            logger.warning("prompt-hidden-states patch install failed in worker ext: %r", exc)
+        return super().__new__(cls)

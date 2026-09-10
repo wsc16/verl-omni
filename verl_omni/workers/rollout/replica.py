@@ -11,10 +11,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging as _lg
+
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 from verl.workers.rollout.replica import RolloutReplicaRegistry
+
+
+def _pHs_patch_verb_vllm_replica_init():
+    """Probe: which replica class does each LLM server actually instantiate.
+
+    Both verl_omni's ``vLLMOmniReplica`` (inherits) and verb's plain
+    ``vLLMReplica`` go through ``vLLMReplica.__init__``, so logging
+    ``type(self).__name__`` here distinguishes omni vs verb server.
+    """
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+
+    orig = vLLMReplica.__init__
+
+    def patched_init(replica_self, replica_rank, config, model_config, *a, **k):
+        import os
+
+        _lg.warning(
+            "[pHs-debug] Replica.__init__ pid=%d cls=%s name=%s teacher=%s",
+            os.getpid(),
+            type(replica_self).__name__,
+            getattr(config, "name", None),
+            k.get("is_teacher_model", False),
+        )
+        return orig(replica_self, replica_rank, config, model_config, *a, **k)
+
+    vLLMReplica.__init__ = patched_init
+
+
+_pHs_patch_verb_vllm_replica_init()
 
 
 class DiffusionOutput(BaseModel):

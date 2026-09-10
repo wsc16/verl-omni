@@ -136,8 +136,9 @@ class OmniAsyncTeacherHiddenStatesManager:
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
         client = self.teacher_client[teacher_key]
+        request_id = uuid4().hex
         teacher_output = await client.generate(
-            request_id=uuid4().hex,
+            request_id=request_id,
             prompt_ids=sequence_ids,
             sampling_params={
                 "max_tokens": 1,
@@ -151,6 +152,23 @@ class OmniAsyncTeacherHiddenStatesManager:
         )
         hidden = teacher_output.extra_fields.get("teacher_hidden_states", None)
         if hidden is None:
+            import os as _os
+
+            print(
+                "[pHs-debug] teacher NO hidden pid=%s req=%s extra_keys=%s mm_keys=%s"
+                % (
+                    _os.getpid(),
+                    request_id,
+                    list(teacher_output.extra_fields.keys()),
+                    list(
+                        getattr(getattr(teacher_output, "outputs", [None])[0], "multimodal_output", None).keys()
+                    )
+                    if getattr(teacher_output, "outputs", None)
+                    and getattr(teacher_output.outputs[0], "multimodal_output", None) is not None
+                    else None,
+                ),
+                flush=True,
+            )
             raise RuntimeError(
                 "Teacher returned no teacher_hidden_states; check that the teacher engine has the "
                 "prompt-hidden-states patch applied and return_prompt_hidden_states was requested."

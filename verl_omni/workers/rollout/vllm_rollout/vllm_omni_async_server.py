@@ -62,12 +62,38 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     def _init_config(self, config):
         """Select one mode strategy before initializing its rollout config."""
+        import sys as _sys
         engine_kwargs = getattr(config, "engine_kwargs", None) or {}
         omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
+        print(
+            f"[pHs-debug] vLLMOmniHttpServer._init_config pid={os.getpid()} cls={type(self).__name__} "
+            f"omni_kw={list(omni_kwargs)} name={getattr(config,'name',None)}",
+            flush=True,
+        )
+        _sys.stdout.flush()
         # TODO (mike): drop this once the legacy omni training script is removed.
         # It should be automatically inferred from the model config.
         strategy_cls = ARStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else DiffusionStrategy
+        logger.warning(
+            "[pHs-debug] vLLMOmniHttpServer._init_config pid=%d strategy=%s bare_replica=%s",
+            os.getpid(),
+            strategy_cls.__name__,
+            self.__class__.__name__,
+        )
         self._generate_strategy = strategy_cls(self)
+        if strategy_cls is ARStrategy:
+            # Install the prompt-hidden-states patch before the engine spawns its
+            # worker sub-processes. The AR teacher/student engine runs its runner
+            # (NPUARModelRunner) in a StageEngineCoreProc; installing here (in the
+            # server actor, pre-fork) lets NPU fork/spawn semantics carry it.
+            try:
+                from verl_omni.workers.rollout.vllm_rollout.prompt_hidden_states import (
+                    apply_prompt_hidden_states_patches,
+                )
+
+                apply_prompt_hidden_states_patches()
+            except ImportError:  # pragma: no cover - verl_omni always present here
+                pass
         self._rollout_flags: dict[int, dict] = {}
         rollout_config = self._generate_strategy.init_config(config)
         if getattr(rollout_config, "seed", None) is None:
@@ -149,6 +175,24 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if deploy_config:
             engine_args["deploy_config"] = deploy_config
 
+        # AR rollouts run their runner (NPUARModelRunner) in a StageEngineCoreProc
+        # sub-process spawned by vLLM-Omni. vLLM's ``--worker-extension-cls`` is the
+        # only hook that executes inside that sub-process, so install the verl_omni
+        # extension there (it does the hidden-state patch; see prompt_hidden_states).
+        if isinstance(self._generate_strategy, ARStrategy):
+            # vLLM-Omni's colocate extension (which this AR rollout needs for
+            # update_weights_from_ipc / LoRA) carries the prompt-hidden-states
+            # patch install in its __new__; setting it as vLLM's
+            # --worker-extension-cls makes the engine worker sub-process run it.
+            engine_args["worker_extension_cls"] = (
+                "verl_omni.workers.rollout.vllm_rollout.utils.vLLMOmniColocateWorkerExtension"
+            )
+            print(
+                "[pHs-debug] run_server set worker_extension_cls pid=%s strategy=ARStrategy"
+                % os.getpid(),
+                flush=True,
+            )
+
         self._generate_strategy.prepare_engine_args(engine_args, args)
 
         if getattr(self.config, "step_execution", False):
@@ -179,8 +223,19 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             )
 
         engine_client = AsyncOmni(**engine_args)
+        print(
+            "[pHs-debug] run_server AsyncOmni created pid=%s tp=%s max_model_len=%s worker_ext=%s"
+            % (
+                os.getpid(),
+                engine_args.get("tensor_model_parallel_size"),
+                engine_args.get("max_model_len"),
+                engine_args.get("worker_extension_cls"),
+            ),
+            flush=True,
+        )
         app = build_app(args)
         await omni_init_app_state(engine_client, app.state, args)
+        print("[pHs-debug] run_server omni_init_app_state done pid=%s" % os.getpid(), flush=True)
 
         # Deploy config YAML is consumed by AsyncOmni above; clean up the temp dir.
         if getattr(self, "_temp_deploy_ctx", None) is not None:
@@ -189,6 +244,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
         self.engine = engine_client
         self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+        print("[pHs-debug] run_server READY pid=%s port=%s" % (os.getpid(), self._server_port), flush=True)
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
@@ -325,6 +381,13 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         negative_extra_prompt_ids: Optional[dict[str, list[int]]] = None,
         priority: int = 0,
     ) -> DiffusionOutput | TokenOutput:
+        import sys as _sys
+        print(
+            f"[pHs-debug] vLLMOmniHttpServer.generate pid={os.getpid()} cls={type(self).__name__} "
+            f"strategy={type(self._generate_strategy).__name__} hidden_flag={sampling_params.get('return_prompt_hidden_states', False)}",
+            flush=True,
+        )
+        _sys.stdout.flush()
         return await self._generate_strategy.generate(
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
@@ -510,6 +573,15 @@ class vLLMOmniReplica(vLLMReplica):
         is_teacher_model: bool = False,
         name_suffix: str = "",
     ):
+        import logging as _lg
+
+        _lg.warning(
+            "[pHs-debug] vLLMOmniReplica.__init__ pid=%d name=%s teacher=%s model=%s",
+            os.getpid(),
+            getattr(config, "name", None),
+            is_teacher_model,
+            getattr(model_config, "path", getattr(model_config, "model", None)),
+        )
         super().__init__(
             replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )

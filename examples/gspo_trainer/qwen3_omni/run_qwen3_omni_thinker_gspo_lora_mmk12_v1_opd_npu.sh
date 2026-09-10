@@ -25,22 +25,22 @@ export VLLM_ASCEND_ENABLE_NZ=0
 # Make verl_omni available to Ray workers
 export VERL_USE_EXTERNAL_MODULES=verl_omni
 
-STUDENT_MODEL=${STUDENT_MODEL:-"$HOME/models/Qwen/Qwen3-Omni-30B-A3B-Instruct-Noised"}
-TEACHER_MODEL=${TEACHER_MODEL:-"$HOME/models/Qwen/Qwen3-Omni-30B-A3B-Instruct"}
+STUDENT_MODEL=${STUDENT_MODEL:-"/data2/model/Qwen3-Omni-30B-A3B-Instruct/"}
+TEACHER_MODEL=${TEACHER_MODEL:-"/data2/model/Qwen3-Omni-30B-A3B-Instruct/"}
 
-TRAIN_FILE=${TRAIN_FILE:-"$HOME/data/mmk12/train.parquet"}
-VAL_FILE=${VAL_FILE:-"$HOME/data/mmk12/test.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/home/w00934247/wsc/mmk12/verl_data/train.parquet"}
+VAL_FILE=${VAL_FILE:-"/home/w00934247/wsc/mmk12/verl_data/test.parquet"}
 REWARD_FUNCTION_PATH=${REWARD_FUNCTION_PATH:-"verl_omni/utils/reward_score/mmk12_reward.py"}
 
-N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-16}
-TEACHER_N_GPUS_PER_NODE=${TEACHER_N_GPUS_PER_NODE:-16}
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-4}
+TEACHER_N_GPUS_PER_NODE=${TEACHER_N_GPUS_PER_NODE:-4}
 
 python3 -m verl_omni.trainer.main_omni \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
-    data.train_batch_size=128 \
+    data.train_batch_size=32 \
     data.max_prompt_length=4096 \
-    data.max_response_length=12288 \
+    data.max_response_length=4096 \
     data.truncation='error' \
     data.filter_overlong_prompts=true \
     actor_rollout_ref.model.path="${STUDENT_MODEL}" \
@@ -59,7 +59,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.optim.clip_grad=1.0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.policy_loss.loss_mode=gspo \
     actor_rollout_ref.actor.clip_ratio_low=3e-4 \
@@ -76,7 +76,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.prompt_length=4160 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.rollout.enable_prefix_caching=False \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.output_mode="ar" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.pipeline_name="qwen3_omni_moe" \
@@ -84,7 +84,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     algorithm.adv_estimator=grpo \
@@ -111,9 +111,9 @@ python3 -m verl_omni.trainer.main_omni \
     distillation.teacher_models.teacher_model.inference.name=vllm_omni \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=2 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.6 \
-    distillation.teacher_models.teacher_model.inference.max_model_len=16640 \
+    distillation.teacher_models.teacher_model.inference.max_model_len=8192 \
     distillation.teacher_models.teacher_model.inference.prompt_length=4160 \
-    distillation.teacher_models.teacher_model.inference.response_length=12288 \
+    distillation.teacher_models.teacher_model.inference.response_length=4096 \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm_omni.output_mode="ar" \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.vllm_omni.pipeline_name="qwen3_omni_moe" \
     distillation.distillation_loss.loss_mode=kl \

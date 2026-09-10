@@ -23,6 +23,11 @@ from verl.trainer.ppo.padding_utils import construct_minimal_padding_template as
 logger = logging.getLogger(__name__)
 
 
+# Patch the module attribute so upsample_batch_to_divisible_size resolves the
+# patched template through verl's padding_utils namespace.
+_padding_utils.construct_minimal_padding_template = patched_padding_template
+
+
 def embeds_padding_2_no_padding(data: TensorDict) -> TensorDict:
     """
     Convert padded diffusion sequence fields to jagged nested tensors.
