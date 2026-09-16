@@ -50,12 +50,15 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_timing_metrics_diffusion,
 )
 from verl_omni.trainer.diffusion.diffusion_trainer_utils import NoOpCheckpointManager
+from verl_omni.trainer.distillation.engine_patch import apply_actor_worker_patch
 from verl_omni.trainer.omni.omni_algos import (
     get_omni_loss_fn,
 )
 from verl_omni.utils.dataset.offline_mllm_dpo_dataset import get_batch_modality
 from verl_omni.utils.metrics_utils import GroupedMetricMean
 from verl_omni.workers.config import OmniModelConfig
+
+apply_actor_worker_patch()
 
 sys_logger = logging.getLogger(__name__)
 
@@ -71,6 +74,21 @@ class OmniPPOTrainerSync(PPOTrainerSync):
         model_config: OmniModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model, OmniModelConfig)
         self.tokenizer = model_config.tokenizer
         self.processor = model_config.processor
+
+    def _ensure_teacher_unembeds(self):
+        if getattr(self, "_teacher_unembeds", None) is not None:
+            return
+
+        from verl_omni.utils.lm_head import load_lm_head_weight
+
+        teacher_models = self.distillation_config.teacher_models
+        unembeds = {}
+        for key, teacher_config in teacher_models.items():
+            w = load_lm_head_weight(teacher_config.model_path)
+            unembeds[key] = w.to(dtype=torch.bfloat16).contiguous()
+
+        self._teacher_unembeds = unembeds
+        self.actor_rollout_wg.set_teacher_unembeds(unembeds)
 
     # The rollout server resumes admission after every successful wake; this
     # bridge remains a safety net for holds not preceded by a wake (init).
