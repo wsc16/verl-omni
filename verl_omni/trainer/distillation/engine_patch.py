@@ -21,9 +21,36 @@ from tensordict import NonTensorData
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-__all__ = ["apply_actor_worker_patch"]
+__all__ = ["apply_loss_route_patch", "apply_actor_worker_patch"]
 
+_LOSS_ROUTE_APPLIED = False
 _ACTOR_WORKER_APPLIED = False
+
+
+def apply_loss_route_patch():
+    global _LOSS_ROUTE_APPLIED
+    if _LOSS_ROUTE_APPLIED:
+        logger.warning("Loss route patch has already been applied.")
+        return
+
+    import verl.trainer.distillation as _vd
+
+    from verl_omni.trainer.distillation.losses import omni_distillation_ppo_loss
+
+    if getattr(_vd, "distillation_ppo_loss", None) is not omni_distillation_ppo_loss:
+        _vd.distillation_ppo_loss = omni_distillation_ppo_loss
+        logger.info("Patched verl.trainer.distillation.distillation_ppo_loss with omni_distillation_ppo_loss.")
+
+    try:
+        import verl.workers.engine_workers as _ve
+
+        if getattr(_ve, "distillation_ppo_loss", None) is not omni_distillation_ppo_loss:
+            _ve.distillation_ppo_loss = omni_distillation_ppo_loss
+            logger.info("Patched verl.workers.engine_workers.distillation_ppo_loss with omni_distillation_ppo_loss.")
+    except ImportError:
+        logger.warning("verl.workers.engine_workers module not found. Skipping patch for engine_workers.")
+
+    _LOSS_ROUTE_APPLIED = True
 
 
 def apply_actor_worker_patch():

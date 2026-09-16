@@ -28,3 +28,6 @@ import verl_omni.reward_loop  # noqa: E402, F401
 import verl_omni.trainer  # noqa: E402, F401
 import verl_omni.workers.engine  # noqa: E402, F401
 import verl_omni.workers.rollout  # noqa: E402, F401
+from verl_omni.trainer.distillation.engine_patch import apply_loss_route_patch  # noqa: E402
+
+apply_loss_route_patch()
