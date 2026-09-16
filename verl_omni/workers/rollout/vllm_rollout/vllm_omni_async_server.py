@@ -149,6 +149,19 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if deploy_config:
             engine_args["deploy_config"] = deploy_config
 
+        # AR rollouts run their runner (NPUARModelRunner) in a StageEngineCoreProc
+        # sub-process spawned by vLLM-Omni. vLLM's ``--worker-extension-cls`` is the
+        # only hook that executes inside that sub-process, so install the verl_omni
+        # extension there (it does the hidden-state patch; see process_hidden_states).
+        if isinstance(self._generate_strategy, ARStrategy):
+            # vLLM-Omni's colocate extension (which this AR rollout needs for
+            # update_weights_from_ipc / LoRA) carries the hidden-states
+            # patch install in its __new__; setting it as vLLM's
+            # --worker-extension-cls makes the engine worker sub-process run it.
+            engine_args["worker_extension_cls"] = (
+                "verl_omni.workers.rollout.vllm_rollout.utils.vLLMOmniColocateWorkerExtension"
+            )
+
         self._generate_strategy.prepare_engine_args(engine_args, args)
 
         if getattr(self.config, "step_execution", False):
